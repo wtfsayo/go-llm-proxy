@@ -7,10 +7,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 type RequestBody struct {
@@ -30,12 +32,16 @@ func createProxy(target string) *httputil.ReverseProxy {
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[%s] Incoming request: %s %s", time.Now().Format(time.RFC3339), r.Method, r.URL.Path)
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 		return
 	}
 	defer r.Body.Close()
+
+	log.Printf("[%s] Incoming request body: %s", time.Now().Format(time.RFC3339), string(body))
 
 	var reqBody RequestBody
 	if err := json.Unmarshal(body, &reqBody); err != nil {
@@ -68,8 +74,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	r.ContentLength = int64(len(modifiedBody))
 	r.Header.Set("Content-Length", fmt.Sprintf("%d", len(modifiedBody)))
 
-	log.Printf("Outgoing request body: %s", string(modifiedBody))
-	log.Printf("Outgoing headers: %v", r.Header)
+	log.Printf("[%s] Outgoing request body: %s", time.Now().Format(time.RFC3339), string(modifiedBody))
 
 	r.Header.Set("Host", os.Getenv("HOST"))
 	r.Header.Set("Content-Type", "application/json")
@@ -84,11 +89,33 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	targetURL := "https://" + os.Getenv("HOST")
 	targetURL = targetURL + r.URL.Path
-
-	log.Printf("Forwarding request to target URL: %s", targetURL)
+	log.Printf("[%s] Forwarding request to target URL: %s", time.Now().Format(time.RFC3339), targetURL)
 
 	proxy := createProxy(targetURL)
-	proxy.ServeHTTP(w, r)
+
+	respRecorder := httptest.NewRecorder()
+	proxy.ServeHTTP(respRecorder, r)
+
+	resp := respRecorder.Result()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[%s] Failed to read response body: %v", time.Now().Format(time.RFC3339), err)
+		http.Error(w, "Failed to read response body", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[%s] Outgoing response body: %s", time.Now().Format(time.RFC3339), string(respBody))
+
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	if _, err := w.Write(respBody); err != nil {
+		log.Printf("[%s] Failed to write response to client: %v", time.Now().Format(time.RFC3339), err)
+	}
 }
 
 func main() {
