@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
@@ -23,31 +22,74 @@ type RequestBody struct {
 	System    string                   `json:"system,omitempty"`
 }
 
+func debugLog(format string, v ...interface{}) {
+	log.Printf("[DEBUG][%s] %s", time.Now().Format(time.RFC3339), fmt.Sprintf(format, v...))
+}
+
 func createProxy(target string) *httputil.ReverseProxy {
 	parsedURL, err := url.Parse(target)
 	if err != nil {
 		log.Fatalf("Failed to parse target URL: %v", err)
 	}
-	return httputil.NewSingleHostReverseProxy(parsedURL)
+	proxy := httputil.NewSingleHostReverseProxy(parsedURL)
+
+	// Customize the director to modify the request before it's sent
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		debugLog("Modified request headers: %+v", req.Header)
+	}
+
+	// Add error handling
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		debugLog("Proxy error: %v", err)
+		http.Error(w, fmt.Sprintf("Proxy error: %v", err), http.StatusBadGateway)
+	}
+
+	// Modify the response before sending it back
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		debugLog("Response status: %d", resp.StatusCode)
+		debugLog("Response headers: %+v", resp.Header)
+		return nil
+	}
+
+	return proxy
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[%s] Incoming request: %s %s", time.Now().Format(time.RFC3339), r.Method, r.URL.Path)
+	debugLog("Incoming request: %s %s", r.Method, r.URL.Path)
+	debugLog("Incoming headers: %+v", r.Header)
+
+	// Check environment variables
+	requiredEnvVars := []string{"HOST", "X_ID", "X_SIGNATURE", "USER_AGENT", "X_LICENSE"}
+	for _, env := range requiredEnvVars {
+		if os.Getenv(env) == "" {
+			debugLog("Missing required environment variable: %s", env)
+			http.Error(w, fmt.Sprintf("Missing required environment variable: %s", env), http.StatusInternalServerError)
+			return
+		}
+	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		debugLog("Failed to read request body: %v", err)
 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 		return
 	}
 	defer r.Body.Close()
 
-	log.Printf("[%s] Incoming request body: %s", time.Now().Format(time.RFC3339), string(body))
+	debugLog("Incoming request body: %s", string(body))
 
 	var reqBody RequestBody
 	if err := json.Unmarshal(body, &reqBody); err != nil {
+		debugLog("Invalid JSON in request body: %v", err)
 		http.Error(w, "Invalid JSON in request body", http.StatusBadRequest)
 		return
 	}
+
+	// Store original stream setting
+	originalStream := reqBody.Stream
+	debugLog("Original stream setting: %v", originalStream)
 
 	switch {
 	case strings.HasPrefix(r.URL.Path, "/anthropic/v1/messages"):
@@ -56,16 +98,14 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/v1/chat/completions"):
 		reqBody.Model = "sw-gpt-4o"
 	default:
+		debugLog("Unknown endpoint: %s", r.URL.Path)
 		http.Error(w, "Unknown endpoint", http.StatusBadRequest)
 		return
 	}
 
-	if reqBody.Stream == false {
-		reqBody.Stream = true
-	}
-
 	modifiedBody, err := json.Marshal(reqBody)
 	if err != nil {
+		debugLog("Failed to modify request body: %v", err)
 		http.Error(w, "Failed to modify request body", http.StatusInternalServerError)
 		return
 	}
@@ -74,56 +114,78 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	r.ContentLength = int64(len(modifiedBody))
 	r.Header.Set("Content-Length", fmt.Sprintf("%d", len(modifiedBody)))
 
-	log.Printf("[%s] Outgoing request body: %s", time.Now().Format(time.RFC3339), string(modifiedBody))
+	debugLog("Outgoing request body: %s", string(modifiedBody))
 
-	r.Header.Set("Host", os.Getenv("HOST"))
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("X-ID", os.Getenv("X_ID"))
-	r.Header.Set("X-Signature", os.Getenv("X_SIGNATURE"))
-	r.Header.Set("Accept", "*/*")
-	r.Header.Set("Connection", "keep-alive")
-	r.Header.Set("User-Agent", os.Getenv("USER_AGENT"))
-	r.Header.Set("X-License", os.Getenv("X_LICENSE"))
-	r.Header.Set("Accept-Encoding", "br;q=1.0, gzip;q=0.9, deflate;q=0.8")
-	r.Header.Set("Accept-Language", "en-US;q=1.0, en-IN;q=0.9")
+	// Set required headers
+	headers := map[string]string{
+		"Host":            os.Getenv("HOST"),
+		"Content-Type":    "application/json",
+		"X-ID":            os.Getenv("X_ID"),
+		"X-Signature":     os.Getenv("X_SIGNATURE"),
+		"Accept":          "*/*",
+		"Connection":      "keep-alive",
+		"User-Agent":      os.Getenv("USER_AGENT"),
+		"X-License":       os.Getenv("X_LICENSE"),
+		"Accept-Encoding": "br;q=1.0, gzip;q=0.9, deflate;q=0.8",
+		"Accept-Language": "en-US;q=1.0, en-IN;q=0.9",
+	}
+
+	for key, value := range headers {
+		r.Header.Set(key, value)
+		debugLog("Setting header %s: %s", key, value)
+	}
 
 	targetURL := "https://" + os.Getenv("HOST")
 	targetURL = targetURL + r.URL.Path
-	log.Printf("[%s] Forwarding request to target URL: %s", time.Now().Format(time.RFC3339), targetURL)
+	debugLog("Forwarding request to target URL: %s", targetURL)
 
 	proxy := createProxy(targetURL)
 
-	respRecorder := httptest.NewRecorder()
-	proxy.ServeHTTP(respRecorder, r)
+	if originalStream {
+		debugLog("Handling streaming response")
+		// Set proper headers for streaming
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Transfer-Encoding", "chunked")
 
-	resp := respRecorder.Result()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("[%s] Failed to read response body: %v", time.Now().Format(time.RFC3339), err)
-		http.Error(w, "Failed to read response body", http.StatusInternalServerError)
-		return
-	}
-	log.Printf("[%s] Outgoing response body: %s", time.Now().Format(time.RFC3339), string(respBody))
-
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
+		// Create a custom response writer that doesn't close the connection
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			debugLog("Streaming not supported")
+			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+			return
 		}
-	}
-	w.WriteHeader(resp.StatusCode)
 
-	if _, err := w.Write(respBody); err != nil {
-		log.Printf("[%s] Failed to write response to client: %v", time.Now().Format(time.RFC3339), err)
+		proxy.ServeHTTP(w, r)
+		flusher.Flush()
+	} else {
+		debugLog("Handling non-streaming response")
+		proxy.ServeHTTP(w, r)
 	}
 }
 
 func main() {
+	// Configure logging
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+
+	debugLog("Starting server with environment variables:")
+	debugLog("HOST: %s", os.Getenv("HOST"))
+	debugLog("HOST: %s", os.Getenv("HOST"))
+	debugLog("X_ID: %s", os.Getenv("X_ID"))
+	debugLog("X_SIGNATURE: %s", os.Getenv("X_SIGNATURE"))
+	debugLog("X_LICENSE: %s", os.Getenv("X_LICENSE"))
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080" // Default to 8080 instead of 443 for testing
+	}
+
 	http.HandleFunc("/v1/", proxyHandler)
 	http.HandleFunc("/anthropic/", proxyHandler)
 
-	log.Println("Starting proxy server on port 443...")
-	if err := http.ListenAndServe(":443", nil); err != nil {
+	debugLog("Starting proxy server on port %s...", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }
